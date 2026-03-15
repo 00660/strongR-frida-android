@@ -1,94 +1,178 @@
-# This is a basic workflow to help you get started with Actions
-name: CI
-# Controls when the workflow will run
-on:  
-# Triggers the workflow on push or pull request events but only for the "main" branch
+name: strongR-frida
+
+on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # Allows you to run this workflow manually from the Actions tab
+  schedule:
+    - cron: "0 9/11 * * *"
   workflow_dispatch:
 
-jobs:
-  build:
+jobs: 
+  check_version:
     runs-on: ubuntu-22.04
 
+    outputs:
+      FRIDA_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
+      ALREADY_RELEASE: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Pull Frida Latest Release
+        id: pullFridaLatestRelease
+        uses: actions/github-script@v3.1.0
         with:
-          node-version: 18
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const releaseResponse = await github.repos.getLatestRelease({
+              owner: 'frida',
+              repo: 'frida',
+            })
+            const {
+              data: { tag_name: ver }
+            } = releaseResponse;
+            core.setOutput('FRIDA_VERSION', ver);
+            
+      - name: Check release version
+        id: checkReleaseVersion
+        uses: actions/github-script@v3.1.0
         with:
-          distribution: "temurin"
-          java-version: "17"
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            try {
+              const releaseVersion = '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'
+              const releaseResponse = await github.repos.getReleaseByTag({
+                owner: '${{ github.repository_owner }}',
+                repo: '${{ github.event.repository.name }}',
+                tag: releaseVersion
+              });
+              const {
+                data: { tag_name: ver }
+              } = releaseResponse;
+              if (ver == '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'){
+                  core.setOutput('ALREADY_RELEASE', '1');
+              }
+              else{
+                  core.setOutput('ALREADY_RELEASE', '0');
+              }
+            } catch (e) {
+              if(e.message == 'Not Found'){
+                core.setOutput('ALREADY_RELEASE', '0');
+              }
+              else{
+                core.setFailed(e.message);
+              }
+            }
 
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1.0.6
+  create_release:
+    needs: check_version
+    runs-on: ubuntu-22.04
+    # 如果你想强制每次 push 都生成 Release，可以注释掉下面这行
+    # if: needs.check_version.outputs.ALREADY_RELEASE == '0'
+
+    steps:
+      - uses: actions/create-release@v1
+        id: createRelease
+        name: Create Runner Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          ndk-version: r25b
+          tag_name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
+          release_name: "StrongR Frida ${{ needs.check_version.outputs.FRIDA_VERSION }}"
+          prerelease: false
 
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5.1.0
-        with:
-          python-version: '3.9'
+  android_build:
+    runs-on: ubuntu-22.04
+    needs: [check_version, create_release]
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update && DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
-            build-essential tree ninja-build gcc-multilib g++-multilib \
-            lib32stdc++-9-dev flex bison ruby ruby-dev python3-requests \
-            python3-setuptools python3-dev python3-pip libc6-dev libc6-dev-i386
-          sudo gem install fpm -v 1.11.0 --no-document
-          python3 -m pip install lief graphlib
+    steps:
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 18
 
-      - name: Clone and Patch Frida
-        shell: bash
-        run: |
-          # 这一步下载原版 frida 并应用所有 strongR-frida 的反检测补丁
-          export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
-          git clone --recurse-submodules https://github.com/frida/frida
-          cd frida
-          for path in ../Patchs/strongR-frida/*
-          do
-            name=$(basename $path)
-            real=$(realpath $path)
-            echo "Applying patches in $real to frida/subprojects/$name"
-            cd subprojects/$name
-            git am ../../../Patchs/strongR-frida/$name/*.patch || true
-            cd ../..
-          done
-          
-          # 我们只需要 arm64 架构的 server (目前市面上 99% 手机都是 arm64)
-          # 如果你需要别的架构，可以把 "android-arm64" 改成 "android-arm android-arm64 android-x86 android-x86_64"
-          ARCHES="android-arm64"
-          for ARCH in $ARCHES
-          do
-            mkdir build-$ARCH
-            cd build-$ARCH
-            ../frida/configure --host=$ARCH
-            make
-            cd ..
-          done
+    - name: set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        distribution: "temurin"
+        java-version: "17"
 
-      - name: Prepare Final Output
-        shell: bash
-        run: |
-          # 把编译好的核心二进制文件提出来，准备打包
-          mkdir -p magic_frida_output
-          cp frida/build-android-arm64/subprojects/frida-core/server/frida-server magic_frida_output/hluda-server-arm64
-          # 还可以加上 gadget 或 inject，如果需要的话
-          # cp frida/build-android-arm64/subprojects/frida-core/lib/gadget/frida-gadget.so magic_frida_output/hluda-gadget-arm64.so
+    - name: Setup Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1.0.6
+      with:
+        ndk-version: r25b
+    
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v5.1.0
+      with:
+        python-version: '3.9'
 
-      - name: Upload Artifacts (ZIP)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Magic-Frida-Server-Arm64
-          path: magic_frida_output/
+    - name: install dependencies
+      run: |
+        sudo apt-get update && DEBIAN_FRONTEND=noninteractive sudo apt-get install build-essential tree ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev flex bison ruby ruby-dev python3-requests python3-setuptools python3-dev python3-pip libc6-dev libc6-dev-i386 -y
+        sudo gem install fpm -v 1.11.0 --no-document
+        python3 -m pip install lief graphlib
+
+    - name: build frida for Android
+      shell: bash
+      run: |
+        git config --global user.name "AutoBuilder"
+        git config --global user.email "bot@example.com"
+        
+        # 1. 下载原版 frida
+        export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
+        git clone --recurse-submodules https://github.com/frida/frida
+        cd frida
+        
+        # 2. 原汁原味：遍历 Patchs 目录打补丁
+        # （前提是你的仓库里必须有 Patchs/strongR-frida/ 这个目录！）
+        for path in ../Patchs/strongR-frida/*
+        do
+          name=$(basename $path)
+          real=$(realpath $path)
+          echo "Apply patches in $real to frida/subprojects/$name"
+          cd subprojects/$name
+          git am ../../../Patchs/strongR-frida/$name/*.patch
+          cd ../..
+        done
+        cd ..
+        
+        # 3. 原汁原味：编译 4 种架构
+        ARCHES="android-arm android-arm64 android-x86 android-x86_64"
+        for ARCH in $ARCHES
+        do
+          mkdir build-$ARCH
+          cd build-$ARCH
+          ../frida/configure --host=$ARCH
+          make
+          cd ..
+        done
+
+    - name: package build result for Android
+      shell: bash
+      run: |
+        gzip build-android-arm/subprojects/frida-core/server/frida-server
+        gzip build-android-arm64/subprojects/frida-core/server/frida-server
+        gzip build-android-x86/subprojects/frida-core/server/frida-server
+        gzip build-android-x86_64/subprojects/frida-core/server/frida-server
+        
+        gzip build-android-arm/subprojects/frida-core/inject/frida-inject
+        gzip build-android-arm64/subprojects/frida-core/inject/frida-inject
+        gzip build-android-x86/subprojects/frida-core/inject/frida-inject
+        gzip build-android-x86_64/subprojects/frida-core/inject/frida-inject
+        
+        gzip build-android-arm/subprojects/frida-core/lib/gadget/frida-gadget.so
+        gzip build-android-arm64/subprojects/frida-core/lib/gadget/frida-gadget.so
+        gzip build-android-x86/subprojects/frida-core/lib/gadget/frida-gadget.so
+        gzip build-android-x86_64/subprojects/frida-core/lib/gadget/frida-gadget.so
+
+    # 原汁原味：强制把所有生成的 .gz 打包进 Artifacts，确保你绝对能下载到！
+    - name: Force Upload All Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: strongR-frida-all-builds
+        path: |
+          build-android-*/subprojects/frida-core/server/frida-server.gz
+          build-android-*/subprojects/frida-core/inject/frida-inject.gz
+          build-android-*/subprojects/frida-core/lib/gadget/frida-gadget.so.gz
