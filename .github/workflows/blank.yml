@@ -195,7 +195,16 @@ jobs:
         asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/server/frida-server.gz'
         asset_name: 'hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.gz'
         asset_content_type: application/octet-stream
-
+    # 强制把所有编译出来的 frida-server 打包成 artifact 提供下载
+    - name: Force Upload Artifacts (Bypass Release)
+      uses: actions/upload-artifact@v4
+      with:
+        name: my-strongR-frida-build
+        path: |
+          build-android-arm64/subprojects/frida-core/server/frida-server.gz
+          build-android-arm/subprojects/frida-core/server/frida-server.gz
+          build-android-x86/subprojects/frida-core/server/frida-server.gz
+          build-android-x86_64/subprojects/frida-core/server/frida-server.gz
     - name: Upload android arm64 frida-server for hluda
       uses: actions/upload-release-asset@v1.0.2
       env:
